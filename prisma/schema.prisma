@@ -1,0 +1,478 @@
+// POS application — Prisma schema
+// Phase 1: User + Outlet + Better Auth tables. Phase 2 adds: Category.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// =====================================================================
+// Customers
+// =====================================================================
+
+model Customer {
+  id         String   @id @default(cuid())
+  name       String
+  phone      String?  @unique
+  email      String?  @unique
+  points     Int      @default(0)
+  totalSpent Decimal  @default(0)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([name])
+}
+
+// =====================================================================
+// Audit log
+// =====================================================================
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  userId     String?
+  user       User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  action     String   // e.g. "order.void", "user.create", "settings.update"
+  entity     String   // "Order" | "User" | "Outlet" | ...
+  entityId   String?
+  data       String?  // JSON string (Prisma JSON type not on SQLite)
+  ip         String?
+  createdAt  DateTime @default(now())
+
+  @@index([userId, createdAt])
+  @@index([entity, entityId])
+  @@index([action, createdAt])
+}
+
+// =====================================================================
+// POS / Orders
+// =====================================================================
+
+enum OrderStatus {
+  DRAFT
+  HELD
+  PAID
+  VOIDED
+  REFUNDED
+}
+
+/**
+ * Kitchen preparation lifecycle for an order, independent of payment status.
+ * NONE     = not sent to kitchen (e.g. draft/held, or a non-food order)
+ * QUEUED   = paid and waiting to be picked up by the kitchen
+ * PREPARING= kitchen is actively preparing it
+ * READY    = prepared, waiting to be served/handed over
+ * SERVED   = handed to the customer (terminal state)
+ */
+enum KitchenStatus {
+  NONE
+  QUEUED
+  PREPARING
+  READY
+  SERVED
+}
+
+enum OrderType {
+  DINE_IN
+  TAKEOUT
+  DELIVERY
+}
+
+enum PaymentMethod {
+  CASH
+  CARD
+  EWALLET
+  QRIS
+  TRANSFER
+  SPLIT
+}
+
+model Order {
+  id            String      @id @default(cuid())
+  orderNumber   String      @unique // e.g. ORD-2026-0001
+  shiftId       String?
+  shift         Shift?      @relation(fields: [shiftId], references: [id], onDelete: SetNull)
+  status        OrderStatus @default(DRAFT)
+  type          OrderType   @default(DINE_IN)
+  kitchenStatus KitchenStatus @default(NONE)
+  subtotal      Decimal     @default(0)
+  discount      Decimal     @default(0) // order-level discount amount (IDR)
+  tax           Decimal     @default(0) // computed: (subtotal - discount) * outlet.taxRate
+  total         Decimal     @default(0) // subtotal - discount + tax
+  customerName  String?
+  customerId    String?     // FK to Customer (Phase 7); null = walk-in
+  discountCode  String?
+  notes         String?
+  voidReason    String?
+  refundReason  String?
+  createdAt     DateTime    @default(now())
+  paidAt        DateTime?
+  voidedAt      DateTime?
+  refundedAt    DateTime?
+  // Kitchen timestamps (set as the order moves through prep)
+  kitchenQueuedAt    DateTime?
+  kitchenPreparingAt DateTime?
+  kitchenReadyAt     DateTime?
+  kitchenServedAt    DateTime?
+
+  items  OrderItem[]
+  payments Payment[]
+
+  @@index([status, createdAt])
+  @@index([shiftId, status])
+  @@index([kitchenStatus, paidAt])
+}
+
+model OrderItem {
+  id           String   @id @default(cuid())
+  orderId      String
+  order        Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  menuItemId   String
+  menuItem     MenuItem @relation(fields: [menuItemId], references: [id], onDelete: Restrict)
+  variantId    String?
+  variant      MenuVariant? @relation(fields: [variantId], references: [id], onDelete: SetNull)
+  nameSnapshot String   // copy of MenuItem.name at sale time
+  variantNameSnapshot String?
+  qty          Int
+  unitPrice    Decimal  // base price + variant priceDelta (per unit)
+  discount     Decimal  @default(0) // line discount (IDR per unit, applied at unit level)
+  lineTotal    Decimal  // (unitPrice - discount) * qty + sum(modifier priceDelta * qty)
+  notes        String?
+  createdAt    DateTime @default(now())
+
+  modifiers OrderItemModifier[]
+
+  @@index([orderId])
+  @@index([menuItemId])
+}
+
+model OrderItemModifier {
+  id                String   @id @default(cuid())
+  orderItemId       String
+  orderItem         OrderItem @relation(fields: [orderItemId], references: [id], onDelete: Cascade)
+  modifierId        String
+  modifier          Modifier @relation(fields: [modifierId], references: [id], onDelete: Restrict)
+  groupNameSnapshot String
+  nameSnapshot      String
+  priceDelta        Decimal
+  createdAt         DateTime @default(now())
+
+  @@index([orderItemId])
+}
+
+model Payment {
+  id        String        @id @default(cuid())
+  orderId   String
+  order     Order         @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  method    PaymentMethod
+  amount    Decimal
+  reference String?       // card last 4, e-wallet ref, etc.
+  paidAt    DateTime      @default(now())
+
+  @@index([orderId])
+}
+
+// =====================================================================
+// Purchase Orders
+// =====================================================================
+
+enum POStatus {
+  DRAFT
+  ORDERED
+  PARTIAL
+  RECEIVED
+  CANCELLED
+}
+
+model PurchaseOrder {
+  id          String   @id @default(cuid())
+  poNumber    String   @unique // e.g. PO-2026-0001
+  // Supplier details are captured inline per-PO (no separate Supplier table):
+  // a manager types the supplier name + contact info when creating the order.
+  supplierName    String
+  supplierContact String?
+  supplierPhone   String?
+  supplierEmail   String?
+  supplierAddress String?
+  status      POStatus @default(DRAFT)
+  total       Decimal  @default(0)
+  notes       String?
+  createdById String?
+  createdBy   User?    @relation("PO_CreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  orderedAt   DateTime?
+  receivedAt  DateTime?
+  cancelledAt DateTime?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  items PurchaseOrderItem[]
+
+  @@index([status, createdAt])
+}
+
+model PurchaseOrderItem {
+  id          String   @id @default(cuid())
+  poId        String
+  po          PurchaseOrder @relation(fields: [poId], references: [id], onDelete: Cascade)
+  stockItemId String
+  stockItem   StockItem @relation(fields: [stockItemId], references: [id], onDelete: Restrict)
+  qty         Decimal  // ordered qty
+  unitCost    Decimal
+  receivedQty Decimal  @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([poId])
+}
+
+// =====================================================================
+// Auth & People
+// =====================================================================
+
+enum Role {
+  ADMIN
+  MANAGER
+  KASIR
+  KITCHEN
+}
+
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  name      String
+  role      Role     @default(KASIR)
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Better Auth fields
+  emailVerified Boolean   @default(false)
+  image         String?
+  sessions      Session[]
+  accounts      Account[]
+
+  stockMovements StockMovement[]
+  createdPOs     PurchaseOrder[] @relation("PO_CreatedBy")
+  shifts         Shift[]
+  auditLogs      AuditLog[]
+
+  @@index([role])
+  @@map("user")
+}
+
+// =====================================================================
+// Tenant
+// =====================================================================
+
+model Outlet {
+  id            String   @id @default(cuid())
+  name          String
+  address       String?
+  phone         String?
+  taxRate       Decimal  @default(0)
+  currency      String   @default("IDR")
+  receiptFooter String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  shifts Shift[]
+}
+
+enum ShiftStatus {
+  OPEN
+  CLOSED
+}
+
+model Shift {
+  id            String      @id @default(cuid())
+  userId        String
+  user          User        @relation(fields: [userId], references: [id], onDelete: Restrict)
+  outletId      String
+  outlet        Outlet      @relation(fields: [outletId], references: [id], onDelete: Restrict)
+  status        ShiftStatus @default(OPEN)
+  openedAt      DateTime    @default(now())
+  closedAt      DateTime?
+  openingCash   Decimal     @default(0)
+  closingCash   Decimal?    // counted at close
+  expectedCash  Decimal?    // calculated at close
+  variance      Decimal?    // closingCash - expectedCash
+  notes         String?
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+
+  orders Order[]
+
+  @@index([userId, openedAt])
+  @@index([outletId, status, openedAt])
+  @@index([status, openedAt])
+}
+
+model Session {
+  id        String   @id
+  expiresAt DateTime
+  token     String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  ipAddress String?
+  userAgent String?
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([token])
+  @@index([userId])
+  @@map("session")
+}
+
+model Account {
+  id                    String    @id
+  accountId             String
+  providerId            String
+  userId                String
+  user                  User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  accessToken           String?
+  refreshToken          String?
+  idToken               String?
+  accessTokenExpiresAt  DateTime?
+  refreshTokenExpiresAt DateTime?
+  scope                 String?
+  password              String?
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+
+  @@index([userId])
+  @@map("account")
+}
+
+model Verification {
+  id         String   @id
+  identifier String
+  value      String
+  expiresAt  DateTime
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([identifier])
+  @@map("verification")
+}
+
+// =====================================================================
+// Catalog
+// =====================================================================
+
+model Category {
+  id        String   @id @default(cuid())
+  name      String   @unique
+  sortOrder Int      @default(0)
+  color     String?  // hex like "#FF0000" for UI badge
+  icon      String?  // lucide icon name, e.g. "Coffee"
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  menuItems MenuItem[]
+
+  @@index([isActive, sortOrder])
+}
+
+model MenuItem {
+  id          String   @id @default(cuid())
+  categoryId  String
+  category    Category @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  name        String
+  sku         String?  @unique
+  barcode     String?  @unique
+  price       Decimal
+  cost        Decimal  @default(0)
+  imageUrl    String?
+  isAvailable Boolean  @default(true)
+  trackStock  Boolean  @default(false)
+  sortOrder   Int      @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  variants   MenuVariant[]
+  modifiers  Modifier[]
+  stock      StockItem?
+  orderItems OrderItem[]
+
+  @@index([categoryId, isAvailable, sortOrder])
+  @@index([isAvailable])
+}
+
+model StockItem {
+  id         String   @id @default(cuid())
+  menuItemId String   @unique
+  menuItem   MenuItem @relation(fields: [menuItemId], references: [id], onDelete: Cascade)
+  currentQty Decimal  @default(0)
+  minQty     Decimal  @default(0) // alert when currentQty <= minQty
+  maxQty     Decimal  @default(0) // target for restock
+  unit       String   @default("pcs")
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  movements StockMovement[]
+  poItems   PurchaseOrderItem[]
+
+  @@index([menuItemId])
+}
+
+enum MovementType {
+  PURCHASE
+  SALE
+  ADJUSTMENT
+  TRANSFER_IN
+  TRANSFER_OUT
+  OPNAME
+}
+
+model StockMovement {
+  id          String       @id @default(cuid())
+  stockItemId String
+  stockItem   StockItem    @relation(fields: [stockItemId], references: [id], onDelete: Cascade)
+  type        MovementType
+  qty         Decimal      // signed: positive = stock in, negative = stock out
+  refType     String?      // "PO" | "Order" | "Opname" | null (manual)
+  refId       String?
+  reason      String?
+  createdById String?
+  createdBy   User?        @relation(fields: [createdById], references: [id], onDelete: SetNull)
+  createdAt   DateTime     @default(now())
+
+  @@index([stockItemId, createdAt])
+  @@index([refType, refId])
+  @@index([createdAt])
+}
+
+model MenuVariant {
+  id         String   @id @default(cuid())
+  menuItemId String
+  menuItem   MenuItem @relation(fields: [menuItemId], references: [id], onDelete: Cascade)
+  name       String
+  priceDelta Decimal  @default(0) // can be negative (e.g. "Small" = -3000)
+  sortOrder  Int      @default(0)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  orderItems OrderItem[]
+
+  @@index([menuItemId, sortOrder])
+}
+
+model Modifier {
+  id         String   @id @default(cuid())
+  menuItemId String
+  menuItem   MenuItem @relation(fields: [menuItemId], references: [id], onDelete: Cascade)
+  groupName  String   // "Toppings", "Milk", "Extra Shot", …
+  name       String   // "Cinnamon", "Oat milk", "1 shot"
+  priceDelta Decimal  @default(0)
+  sortOrder  Int      @default(0)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  orderItemModifiers OrderItemModifier[]
+
+  @@index([menuItemId, groupName, sortOrder])
+}
